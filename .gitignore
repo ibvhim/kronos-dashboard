@@ -1,0 +1,17 @@
+# ── External repos ───────────────────────────
+Kronos/
+
+# ── AI agent configs ─────────────────────────
+.agent/
+.agents/
+.claude/
+.gemini/
+
+# ── Architecture doc (generated artifact) ────
+kronos_live_dashboard_architecture.md
+
+# ── OS / IDE ─────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
