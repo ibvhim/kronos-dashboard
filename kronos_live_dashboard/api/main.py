@@ -8,6 +8,59 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict
+import uuid
+from datetime import datetime, timezone
+import numpy as np
+import logging
+import json
+import time
+
+class JSONFormatter(logging.Formatter):
+    def format(self, record):
+        log_obj = {
+            "timestamp": self.formatTime(record, self.datefmt),
+            "level": record.levelname,
+            "message": record.getMessage(),
+        }
+        if hasattr(record, "structured_data"):
+            log_obj.update(record.structured_data)
+        if record.exc_info:
+            log_obj["exc_info"] = self.formatException(record.exc_info)
+        return json.dumps(log_obj)
+
+logger = logging.getLogger("kronos_api")
+logger.setLevel(logging.INFO)
+ch = logging.StreamHandler()
+ch.setFormatter(JSONFormatter())
+if not logger.handlers:
+    logger.addHandler(ch)
+
+try:
+    from api.baselines import generate_baselines
+except ImportError:
+    try:
+        from baselines import generate_baselines
+    except ImportError as e:
+        print("Baselines import failed:", e)
+
+try:
+    from api.regime import detect_regime
+except ImportError:
+    try:
+        from regime import detect_regime
+    except ImportError as e:
+        print("Regime import failed:", e)
+
+# Import Replay and Backtest logic
+try:
+    from api.replay import run_replay_forecast, ReplayRequest
+    from api.backtest import run_mini_backtest, BacktestRequest
+except ImportError:
+    try:
+        from replay import run_replay_forecast, ReplayRequest
+        from backtest import run_mini_backtest, BacktestRequest
+    except ImportError as e:
+        print("Replay/backtest import failed:", e)
 
 # Append the Kronos directory to sys.path so we can import models without modifying the original source
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'Kronos')))
@@ -33,8 +86,10 @@ app.add_middleware(
 # Global store for lazy-loaded models & tokenizer
 # Format: {"tokenizer": ..., "models": {"kronos-small": KronosPredictor(...), ...}}
 GLOBAL_STATE = {
-    "tokenizer": None,
-    "predictors": {}
+    "tokenizers": {},
+    "predictors": {},
+    "metrics_store": {},
+    "forecast_store": {}
 }
 
 AVAILABLE_MODELS = {
@@ -63,6 +118,14 @@ class PredictRequest(BaseModel):
     pred_len: int = 120
     temperature: float = 1.0
     top_p: float = 0.9
+    sample_count: int = 1
+    aggregation_method: str = "mean"
+    return_paths: bool = False
+    return_quantiles: bool = True
+    quantiles: List[float] = [0.1, 0.25, 0.5, 0.75, 0.9]
+    run_label: Optional[str] = None
+    store_forecast: bool = False
+    return_baselines: bool = False
 
 @app.get("/api/models")
 async def get_models():
@@ -208,29 +271,38 @@ async def get_tickers():
 
 @app.post("/api/load_model")
 async def load_model(req: LoadModelRequest):
+    t_start = time.time()
     if not MODEL_AVAILABLE:
         raise HTTPException(status_code=500, detail="Kronos library not available.")
         
     if req.model_name not in AVAILABLE_MODELS:
         raise HTTPException(status_code=400, detail="Invalid model name.")
         
-    if GLOBAL_STATE["tokenizer"] is None:
-        GLOBAL_STATE["tokenizer"] = KronosTokenizer.from_pretrained("NeoQuasar/Kronos-Tokenizer-base")
+    tokenizer_id = "NeoQuasar/Kronos-Tokenizer-2k" if req.model_name == 'kronos-mini' else "NeoQuasar/Kronos-Tokenizer-base"
+        
+    if tokenizer_id not in GLOBAL_STATE["tokenizers"]:
+        GLOBAL_STATE["tokenizers"][tokenizer_id] = KronosTokenizer.from_pretrained(tokenizer_id)
+        
+    tokenizer = GLOBAL_STATE["tokenizers"][tokenizer_id]
         
     if req.model_name not in GLOBAL_STATE["predictors"]:
         model_config = AVAILABLE_MODELS[req.model_name]
         try:
-            print(f"Loading {req.model_name}...")
             model = Kronos.from_pretrained(model_config['model_id'])
             predictor = KronosPredictor(
                 model, 
-                GLOBAL_STATE["tokenizer"], 
+                tokenizer, 
                 device=req.device, 
                 max_context=model_config['context_length']
             )
             GLOBAL_STATE["predictors"][req.model_name] = predictor
+            load_time = time.time() - t_start
+            logger.info("Model loaded", extra={"structured_data": {"event": "model_load", "model": req.model_name, "latency_sec": load_time, "cache": "miss"}})
         except Exception as e:
+            logger.error("Failed to load model", exc_info=True, extra={"structured_data": {"event": "model_load_error", "model": req.model_name}})
             raise HTTPException(status_code=500, detail=f"Failed to load model: {str(e)}")
+    else:
+        logger.info("Model already in cache", extra={"structured_data": {"event": "model_load", "model": req.model_name, "cache": "hit"}})
             
     return {"status": "success", "message": f"{req.model_name} loaded."}
 
@@ -279,9 +351,14 @@ async def run_predict(req: PredictRequest):
     
     # We run prediction sequentially (to avoid OOM on single GPU/CPU)
     for ticker in req.tickers:
+        t_start = time.time()
         try:
             # 1. Fetch live data
-            df = fetch_live_data(ticker, req.lookback)
+            try:
+                df = fetch_live_data(ticker, req.lookback)
+            except Exception as e:
+                logger.error("Ticker fetch failure", extra={"structured_data": {"event": "ticker_fetch_failure", "ticker": ticker, "error": str(e)}})
+                raise e
             if len(df) < req.lookback:
                 # If less than requested, use what we have, but Kronos might fail if it's too short.
                 pass
@@ -309,33 +386,108 @@ async def run_predict(req: PredictRequest):
             
             # 2. Inference
             print(f"Running inference for {ticker}...")
-            pred_df = predictor.predict(
-                df=x_df,
-                x_timestamp=x_timestamp,
-                y_timestamp=y_timestamp,
-                pred_len=req.pred_len,
-                T=req.temperature,
-                top_p=req.top_p,
-                sample_count=1,
-                verbose=False
-            )
+            
+            all_preds = []
+            for i in range(req.sample_count):
+                pred_df = predictor.predict(
+                    df=x_df,
+                    x_timestamp=x_timestamp,
+                    y_timestamp=y_timestamp,
+                    pred_len=req.pred_len,
+                    T=req.temperature,
+                    top_p=req.top_p,
+                    sample_count=1,
+                    verbose=False
+                )
+                all_preds.append(pred_df)
             
             # 3. Format output
             historical_data = df.to_dict('records')
             
-            # Format prediction
+            cols = ['open', 'high', 'low', 'close']
+            tensor_3d = np.stack([p[cols].values for p in all_preds], axis=0) # (sample_count, pred_len, num_cols)
+            
+            mean_vals = np.mean(tensor_3d, axis=0)
+            median_vals = np.median(tensor_3d, axis=0)
+            std_vals = np.std(tensor_3d, axis=0)
+            min_vals = np.min(tensor_3d, axis=0)
+            max_vals = np.max(tensor_3d, axis=0)
+
+            if req.aggregation_method == 'mean':
+                agg_vals = mean_vals
+            elif req.aggregation_method == 'median':
+                agg_vals = median_vals
+            elif req.aggregation_method == 'trimmed_mean':
+                lower = np.percentile(tensor_3d, 10, axis=0, keepdims=True)
+                upper = np.percentile(tensor_3d, 90, axis=0, keepdims=True)
+                mask = (tensor_3d >= lower) & (tensor_3d <= upper)
+                trimmed_sum = np.sum(tensor_3d * mask, axis=0)
+                trimmed_count = np.sum(mask, axis=0)
+                agg_vals = trimmed_sum / np.maximum(trimmed_count, 1)
+            else:
+                agg_vals = mean_vals
+
+            q_vals = {}
+            if req.return_quantiles:
+                for q in req.quantiles:
+                    q_vals[q] = np.quantile(tensor_3d, q, axis=0)
+            
             pred_records = []
-            for j, (_, row) in enumerate(pred_df.iterrows()):
-                pred_records.append({
+            for j in range(req.pred_len):
+                rec = {
                     "timestamps": future_timestamps[j].isoformat(),
-                    "open": float(row['open']),
-                    "high": float(row['high']),
-                    "low": float(row['low']),
-                    "close": float(row['close']),
-                    "volume": float(row.get('volume', 0))
-                })
+                }
+                for c_idx, c in enumerate(cols):
+                    rec[f"mean_{c}"] = float(mean_vals[j, c_idx])
+                    rec[f"median_{c}"] = float(median_vals[j, c_idx])
+                    rec[f"trimmed_mean_{c}"] = float(agg_vals[j, c_idx])
+                    rec[f"std_{c}"] = float(std_vals[j, c_idx])
+                    rec[f"min_{c}"] = float(min_vals[j, c_idx])
+                    rec[f"max_{c}"] = float(max_vals[j, c_idx])
+                    
+                    if req.return_quantiles:
+                        for q in req.quantiles:
+                            q_str = f"q{int(q*100)}_{c}"
+                            rec[q_str] = float(q_vals[q][j, c_idx])
+                    
+                    rec[c] = float(agg_vals[j, c_idx])
+                    
+                rec["volume"] = float(all_preds[0]['volume'].iloc[j]) if 'volume' in all_preds[0].columns else 0.0
+                pred_records.append(rec)
                 
-            results[ticker] = {
+            current_regime = None
+            try:
+                if 'detect_regime' in globals():
+                    current_regime = detect_regime(df, ticker)
+            except Exception as e:
+                print("Regime detection failed:", str(e))
+                
+            if req.store_forecast:
+                forecast_id = str(uuid.uuid4())
+                forecast_run = {
+                    "forecast_id": forecast_id,
+                    "ticker": ticker,
+                    "model_name": req.model_name,
+                    "tokenizer_id": "NeoQuasar/Kronos-Tokenizer-2k" if req.model_name == 'kronos-mini' else "NeoQuasar/Kronos-Tokenizer-base",
+                    "horizon": req.pred_len,
+                    "lookback": req.lookback,
+                    "temperature": req.temperature,
+                    "top_p": req.top_p,
+                    "sample_count": req.sample_count,
+                    "aggregation_method": req.aggregation_method,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "historical_window_end": df['timestamps'].iloc[-1].isoformat(),
+                    "predicted_timestamps": [future_timestamps[j].isoformat() for j in range(req.pred_len)],
+                    "predicted_paths": [] if not req.return_paths else [ [float(p['close'].iloc[j]) for j in range(req.pred_len)] for p in all_preds ],
+                    "aggregated_forecast": pred_records,
+                    "regime": current_regime,
+                    "status": "pending",
+                    "run_label": req.run_label,
+                    "user_session_id": None
+                }
+                GLOBAL_STATE["forecast_store"][forecast_id] = forecast_run
+                
+            out_res = {
                 "historical": [
                     {**row, "timestamps": row["timestamps"].isoformat()} 
                     for row in historical_data
@@ -343,11 +495,23 @@ async def run_predict(req: PredictRequest):
                 "prediction": pred_records,
                 "latest_time": df['timestamps'].iloc[-1].isoformat()
             }
+            if current_regime:
+                out_res["regime"] = current_regime
+            if req.store_forecast:
+                out_res["forecast_id"] = forecast_id
+            if req.return_paths:
+                out_res["paths"] = [ [float(p['close'].iloc[j]) for j in range(req.pred_len)] for p in all_preds ]
+            if req.return_baselines:
+                if 'generate_baselines' in globals():
+                    out_res["baselines"] = generate_baselines(df, future_timestamps)
+
+            results[ticker] = out_res
+            pred_time = time.time() - t_start
+            logger.info("Prediction successful", extra={"structured_data": {"event": "predict", "ticker": ticker, "model": req.model_name, "latency_sec": pred_time, "sample_count": req.sample_count}})
             
         except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"Error predicting {ticker}: {e}")
+            pred_time = time.time() - t_start
+            logger.error("Predict error", exc_info=True, extra={"structured_data": {"event": "predict_error", "ticker": ticker, "model": req.model_name, "latency_sec": pred_time}})
             results[ticker] = {"error": str(e)}
             
     return {"status": "success", "results": results}
@@ -392,6 +556,264 @@ async def poll_prices(ticker: str):
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+@app.post("/api/score_pending")
+async def score_pending():
+    t_start = time.time()
+    try:
+        scored_count = 0
+        pending_by_ticker = {}
+        for fid, f in GLOBAL_STATE["forecast_store"].items():
+            if f["status"] in ["pending", "partially_scored"]:
+                pending_by_ticker.setdefault(f["ticker"], []).append(fid)
+                
+        for ticker, fids in pending_by_ticker.items():
+            try:
+                df = fetch_live_data(ticker, lookback=1440)
+            except Exception as e:
+                logger.error("Score fetch failure", extra={"structured_data": {"event": "ticker_fetch_failure", "ticker": ticker, "error": str(e)}})
+                continue
+                
+            # Timezone aware/naive handling
+            ts_index = pd.DatetimeIndex(df['timestamps'])
+            if ts_index.tz is not None:
+                ts_index = ts_index.tz_localize(None)
+                
+            realized_series = pd.Series(df['close'].values, index=ts_index)
+            
+            for fid in fids:
+                f = GLOBAL_STATE["forecast_store"][fid]
+                preds = f["aggregated_forecast"]
+                
+                y_pred = []
+                y_true = []
+                
+                for j, p in enumerate(preds):
+                    ts = pd.to_datetime(p["timestamps"])
+                    if ts.tz is not None:
+                        ts = ts.tz_localize(None)
+                    
+                    if ts in realized_series.index:
+                        y_pred.append(p["close"])
+                        y_true.append(realized_series[ts])
+                
+                if len(y_true) > 0:
+                    y_pred_arr = np.array(y_pred)
+                    y_true_arr = np.array(y_true)
+                    mae = np.mean(np.abs(y_true_arr - y_pred_arr))
+                    rmse = np.sqrt(np.mean((y_true_arr - y_pred_arr)**2))
+                    
+                    f["scoring"] = {
+                        "scored_points": len(y_true),
+                        "mae": float(mae),
+                        "rmse": float(rmse),
+                        "realized": [{"ts": ts.isoformat() if hasattr(ts, "isoformat") else str(ts), "close": val} for ts, val in zip(realized_series.index, y_true_arr)]
+                    }
+                    
+                    if len(y_true) == len(preds):
+                        f["status"] = "fully_scored"
+                    else:
+                        f["status"] = "partially_scored"
+                        
+                    scored_count += 1
+    
+        score_time = time.time() - t_start
+        logger.info("Scored forecasts", extra={"structured_data": {"event": "score_pending", "scored_count": scored_count, "latency_sec": score_time}})
+        return {"status": "success", "scored_forecasts": scored_count}
+    except Exception as e:
+        logger.error("Score pending error", exc_info=True, extra={"structured_data": {"event": "score_pending_error"}})
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+@app.get("/api/leaderboard")
+async def get_leaderboard(ticker: str = None):
+    t_start = time.time()
+    metrics = {}
+    for fid, f in GLOBAL_STATE["forecast_store"].items():
+        if ticker and f["ticker"] != ticker:
+            continue
+        if "scoring" not in f:
+            continue
+        
+        m_name = f["model_name"]
+        mae = f["scoring"].get("mae")
+        rmse = f["scoring"].get("rmse")
+        if mae is None:
+            continue
+            
+        if m_name not in metrics:
+            metrics[m_name] = {"overall": {"mae_sum": 0, "rmse_sum": 0, "count": 0}, "regimes": {}}
+            
+        metrics[m_name]["overall"]["mae_sum"] += mae
+        metrics[m_name]["overall"]["rmse_sum"] += rmse
+        metrics[m_name]["overall"]["count"] += 1
+        
+        regm = f.get("regime")
+        if regm:
+            for r_type, r_val in regm.items(): # e.g. 'trend': 'trending up'
+                if r_type not in metrics[m_name]["regimes"]:
+                    metrics[m_name]["regimes"][r_type] = {}
+                if r_val not in metrics[m_name]["regimes"][r_type]:
+                    metrics[m_name]["regimes"][r_type][r_val] = {"mae_sum": 0, "rmse_sum": 0, "count": 0}
+                metrics[m_name]["regimes"][r_type][r_val]["mae_sum"] += mae
+                metrics[m_name]["regimes"][r_type][r_val]["rmse_sum"] += rmse
+                metrics[m_name]["regimes"][r_type][r_val]["count"] += 1
+        
+    leaderboard = {}
+    for m, mdata in metrics.items():
+        leaderboard[m] = {
+            "overall": {
+                "mae": mdata["overall"]["mae_sum"] / mdata["overall"]["count"],
+                "rmse": mdata["overall"]["rmse_sum"] / mdata["overall"]["count"],
+                "count": mdata["overall"]["count"]
+            },
+            "regimes": {}
+        }
+        for r_type, r_dict in mdata["regimes"].items():
+            leaderboard[m]["regimes"][r_type] = {}
+            for r_val, r_stats in r_dict.items():
+                leaderboard[m]["regimes"][r_type][r_val] = {
+                    "mae": r_stats["mae_sum"] / r_stats["count"],
+                    "rmse": r_stats["rmse_sum"] / r_stats["count"],
+                    "count": r_stats["count"]
+                }
+            leaderboard[m]["regimes"]["session"] = {"overall": {"mae": mdata["overall"]["mae_sum"] / mdata["overall"]["count"], "rmse": mdata["overall"]["rmse_sum"] / mdata["overall"]["count"], "count": 1}}
+
+    lb_time = time.time() - t_start
+    logger.info("Generated leaderboard", extra={"structured_data": {"event": "get_leaderboard", "latency_sec": lb_time}})
+    return {"status": "success", "leaderboard": leaderboard}
+
+
+class EnsemblePredictRequest(BaseModel):
+    tickers: List[str]
+    lookback: int = 400
+    pred_len: int = 120
+    models: List[str]
+    weighting_scheme: str = 'equal' # equal, inverse_mae
+    sample_count: int = 1
+
+@app.post("/api/ensemble_predict")
+async def run_ensemble_predict(req: EnsemblePredictRequest):
+    # Generate predictions for each model
+    results = {}
+    for ticker in req.tickers:
+        ticker_preds = []
+        model_names = []
+        for model_name in req.models:
+            # We call the same internal logic basically or formulate an internal predictor request
+            if model_name not in GLOBAL_STATE["predictors"]:
+                continue
+                
+            predictor = GLOBAL_STATE["predictors"][model_name]
+            try:
+                df = fetch_live_data(ticker, req.lookback)
+                df['timestamps'] = pd.to_datetime(df['timestamps'])
+                if df['timestamps'].dt.tz is not None:
+                    df['timestamps'] = df['timestamps'].dt.tz_localize(None)
+                    
+                x_df = df[['open', 'high', 'low', 'close', 'volume']].copy()
+                for col in ['open', 'high', 'low', 'close', 'volume']:
+                    x_df[col] = pd.to_numeric(x_df[col], errors='coerce').astype(float)
+                x_df = x_df.reset_index(drop=True)
+                
+                x_timestamp = df['timestamps'].reset_index(drop=True)
+                time_diff = x_timestamp.iloc[-1] - x_timestamp.iloc[-2] if len(x_timestamp) > 1 else pd.Timedelta(minutes=1)
+                future_timestamps = pd.date_range(
+                    start=x_timestamp.iloc[-1] + time_diff,
+                    periods=req.pred_len,
+                    freq=time_diff
+                )
+                y_timestamp = pd.Series(future_timestamps, name='timestamps').reset_index(drop=True)
+                
+                pred_df = predictor.predict(
+                    df=x_df,
+                    x_timestamp=x_timestamp,
+                    y_timestamp=y_timestamp,
+                    pred_len=req.pred_len,
+                    T=1.0,
+                    top_p=0.9,
+                    sample_count=req.sample_count,
+                    verbose=False
+                )
+                ticker_preds.append(pred_df['close'].values)
+                model_names.append(model_name)
+                
+            except Exception as e:
+                print(e)
+                continue
+                
+        if not ticker_preds:
+            results[ticker] = {"error": "No models succeeded"}
+            continue
+            
+        tensor_2d = np.stack(ticker_preds, axis=0) # (num_models, pred_len)
+        
+        # Determine weights
+        weights = np.ones(len(model_names)) / len(model_names)
+        
+        if req.weighting_scheme == 'inverse_mae':
+            mae_list = []
+            for m in model_names:
+                # get score from leaderboard
+                mae_sum = 0
+                count = 0
+                for fid, f in GLOBAL_STATE["forecast_store"].items():
+                    if f["ticker"] == ticker and f["model_name"] == m and "scoring" in f:
+                        if f["scoring"].get("mae") is not None:
+                            mae_sum += f["scoring"]["mae"]
+                            count += 1
+                if count > 0:
+                    mae_list.append(mae_sum / count)
+                else:
+                    # fallback to some default
+                    mae_list.append(1.0)
+            
+            mae_arr = np.array(mae_list)
+            inv_mae = 1.0 / (mae_arr + 1e-6)
+            weights = inv_mae / np.sum(inv_mae)
+            
+        ensemble_pred = np.average(tensor_2d, axis=0, weights=weights)
+        
+        pred_records = []
+        for j in range(req.pred_len):
+            pred_records.append({
+                "timestamps": future_timestamps[j].isoformat(),
+                "close": float(ensemble_pred[j])
+            })
+            
+        results[ticker] = {
+            "prediction": pred_records,
+            "weights": {m: float(w) for m, w in zip(model_names, weights)},
+            "models_used": model_names
+        }
+        
+    return {"status": "success", "results": results}
+
+@app.post("/api/replay")
+async def api_replay(req: ReplayRequest):
+    if not MODEL_AVAILABLE:
+        raise HTTPException(status_code=500, detail="Kronos library not available.")
+    if req.model_name not in GLOBAL_STATE["predictors"]:
+        raise HTTPException(status_code=400, detail="Model not loaded. Call /load_model first.")
+        
+    try:
+        return run_replay_forecast(req, GLOBAL_STATE["predictors"][req.model_name])
+    except Exception as e:
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
+
+@app.post("/api/backtest")
+async def api_backtest(req: BacktestRequest):
+    if not MODEL_AVAILABLE:
+        raise HTTPException(status_code=500, detail="Kronos library not available.")
+    if req.model_name not in GLOBAL_STATE["predictors"]:
+        raise HTTPException(status_code=400, detail="Model not loaded. Call /load_model first.")
+        
+    try:
+        return run_mini_backtest(req, GLOBAL_STATE["predictors"][req.model_name])
+    except Exception as e:
+        import traceback
+        return {"error": str(e), "traceback": traceback.format_exc()}
 
 if __name__ == "__main__":
     # Ensure uvicorn runs on IP

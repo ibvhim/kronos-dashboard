@@ -1,29 +1,10 @@
-import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import axios from 'axios';
-import {
-  LineChart, Line, AreaChart, Area, BarChart, Bar,
-  XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid, Legend,
-  ReferenceLine
-} from 'recharts';
-import { Target, Activity, Plus, Trash2, Loader, TrendingUp, Eraser, X, Maximize2, Minimize2, Sun, Moon, Search } from 'lucide-react';
+import { Target, Activity, Moon, Sun, BarChart2, X, ChevronRight } from 'lucide-react';
 import './index.css';
+import StockCard from './StockCard';
 
 const API_URL = 'http://localhost:8001/api';
-
-const DAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
-
-const PRED_COLORS = [
-  '#d97706', '#db2777', '#7c3aed', '#059669',
-  '#ea580c', '#0284c7', '#c026d3', '#ca8a04',
-];
-
-// Dark-mode-friendly prediction colors
-const PRED_COLORS_DARK = [
-  '#fbbf24', '#f472b6', '#a78bfa', '#34d399',
-  '#fb923c', '#38bdf8', '#e879f9', '#facc15',
-];
-
-let predIdCounter = 0;
 
 /* ─── useTheme hook ───────────────────────────────────── */
 function useTheme() {
@@ -57,72 +38,7 @@ class ErrorBoundary extends React.Component {
   }
 }
 
-/* ─── Custom Tooltip ──────────────────────────────────── */
-const KronosTooltip = ({ active, payload, predictions, theme }) => {
-  if (!active || !payload || payload.length === 0) return null;
-  const point = payload[0]?.payload;
-  if (!point) return null;
-
-  const dateObj = new Date(point.fullTime);
-  const dayName = DAYS[dateObj.getDay()];
-  const dateStr = dateObj.toLocaleDateString([], { month: 'short', day: 'numeric' });
-  const timeStr = dateObj.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-
-  const gtColor = theme === 'dark' ? '#6ba3d6' : '#2563b4';
-  const meanColor = theme === 'dark' ? '#e4ddd4' : '#1a1714';
-  const upColor = theme === 'dark' ? '#5ec9a2' : '#1a9a6a';
-  const downColor = theme === 'dark' ? '#e06060' : '#d03030';
-
-  const predEntries = (predictions || []).map(p => ({ ...p, value: point[`pred_${p.id}`] }));
-  const meanVal = point.mean;
-
-  return (
-    <div className="custom-tooltip">
-      <div className="tooltip-header">
-        <span className="day">{dayName}</span> · {dateStr} · {timeStr}
-      </div>
-      <div className="tooltip-row">
-        <span className="label"><span className="dot" style={{ background: gtColor }} />Ground Truth</span>
-        {point.groundTruth != null ? <span className="value gt">${Number(point.groundTruth).toFixed(2)}</span> : <span className="no-data">—</span>}
-      </div>
-      {predEntries.map(pe => (
-        <div className="tooltip-row" key={pe.id}>
-          <span className="label">
-            <span className="dot" style={{ background: pe.color }} />
-            P{pe.id} <span style={{ color: 'var(--ink-muted)', fontSize: '0.72rem' }}>({pe.model} · {pe.predLen}m)</span>
-          </span>
-          {pe.value != null ? <span className="value" style={{ color: pe.color }}>${Number(pe.value).toFixed(2)}</span> : <span className="no-data">—</span>}
-        </div>
-      ))}
-      {predictions && predictions.length >= 2 && (
-        <div className="tooltip-row" style={{ borderTop: '1px solid var(--edge)', marginTop: '0.25rem', paddingTop: '0.3rem' }}>
-          <span className="label"><span className="dot" style={{ background: meanColor }} />Mean</span>
-          {meanVal != null ? <span className="value" style={{ color: meanColor }}>${Number(meanVal).toFixed(2)}</span> : <span className="no-data">—</span>}
-        </div>
-      )}
-      {point.groundTruth != null && meanVal != null && (
-        <div className="tooltip-row" style={{ marginTop: '0.15rem' }}>
-          <span className="label" style={{ fontSize: '0.75rem' }}>Δ Mean vs GT</span>
-          <span className="value" style={{ color: (meanVal - point.groundTruth) >= 0 ? upColor : downColor, fontSize: '0.75rem' }}>
-            {(meanVal - point.groundTruth) >= 0 ? '+' : ''}${(meanVal - point.groundTruth).toFixed(2)}
-          </span>
-        </div>
-      )}
-    </div>
-  );
-};
-
-/* ─── Prediction Chip ─────────────────────────────────── */
-const PredictionChip = ({ pred, onRemove }) => (
-  <div className="pred-chip" style={{ borderColor: pred.color + '44' }}>
-    <span className="pred-chip-dot" style={{ background: pred.color }} />
-    <span className="pred-chip-label">P{pred.id}</span>
-    <span className="pred-chip-meta">
-      {pred.model} · {pred.predLen}m · {new Date(pred.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-    </span>
-    <button className="pred-chip-remove" onClick={() => onRemove(pred.id)} title="Remove"><X size={12} /></button>
-  </div>
-);
+// Removed redundant components that are now inside StockCard
 
 /* ─── Ticker Search Dropdown ──────────────────────────── */
 const TickerSearch = ({ tickerData, onSelect, activeTickers }) => {
@@ -219,252 +135,7 @@ const TickerSearch = ({ tickerData, onSelect, activeTickers }) => {
   );
 };
 
-/* ─── Stock Chart Card ────────────────────────────────── */
-const StockCard = ({ ticker, models, onRemove, span, onToggleSpan, theme }) => {
-  const [gtData, setGtData] = useState([]);
-  const [predictions, setPredictions] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState(null);
-  const [latestPrice, setLatestPrice] = useState(null);
-  const [chartType, setChartType] = useState('line');
-  const [cardModel, setCardModel] = useState(models[0] || '');
-  const [cardPredLen, setCardPredLen] = useState(10);
-  const [predicting, setPredicting] = useState(false);
-  const pollRef = useRef(null);
-
-  const predColors = theme === 'dark' ? PRED_COLORS_DARK : PRED_COLORS;
-  const gtColor = theme === 'dark' ? '#6ba3d6' : '#2563b4';
-  const meanColor = theme === 'dark' ? '#e4ddd4' : '#1a1714';
-  const axisColor = theme === 'dark' ? '#6b6055' : '#8a837b';
-  const gridColor = theme === 'dark' ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.06)';
-  const refLineColor = theme === 'dark' ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.1)';
-
-  useEffect(() => {
-    const fetchHistory = async () => {
-      try {
-        setLoading(true); setError(null);
-        if (!cardModel) { setError('No model available'); setLoading(false); return; }
-        await axios.post(`${API_URL}/load_model`, { model_name: cardModel });
-        const res = await axios.post(`${API_URL}/predict`, { model_name: cardModel, tickers: [ticker], lookback: 120, pred_len: 1 });
-        const tickRes = res.data.results[ticker];
-        if (tickRes?.error) { setError(tickRes.error); setLoading(false); return; }
-        if (!tickRes?.historical?.length) { setError('No data received'); setLoading(false); return; }
-        const history = tickRes.historical.map(h => ({
-          time: new Date(h.timestamps).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-          fullTime: h.timestamps, groundTruth: Number(h.close),
-        }));
-        setGtData(history);
-        setLatestPrice(Number(tickRes.historical[tickRes.historical.length - 1].close));
-        setLoading(false);
-        startPolling();
-      } catch (e) { setError(e.response?.data?.detail || e.message); setLoading(false); }
-    };
-    fetchHistory();
-    return () => clearInterval(pollRef.current);
-  }, [ticker]);
-
-  useEffect(() => { if (!cardModel && models.length > 0) setCardModel(models[0]); }, [models]);
-
-  const startPolling = useCallback(() => {
-    clearInterval(pollRef.current);
-    pollRef.current = setInterval(async () => {
-      try {
-        const pollRes = await axios.get(`${API_URL}/poll?ticker=${ticker}`);
-        if (pollRes.data.status === 'success') {
-          const liveData = pollRes.data.data;
-          const newClose = Number(liveData.close);
-          if (!isNaN(newClose)) setLatestPrice(newClose);
-          setGtData(prev => {
-            const liveTime = new Date(liveData.timestamps).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-            const out = [...prev];
-            const idx = out.findIndex(d => d.time === liveTime);
-            if (idx !== -1) { out[idx] = { ...out[idx], groundTruth: newClose }; }
-            else { out.push({ time: liveTime, fullTime: liveData.timestamps, groundTruth: newClose }); out.sort((a, b) => new Date(a.fullTime) - new Date(b.fullTime)); }
-            return out;
-          });
-        }
-      } catch (e) { console.error('Polling error', e); }
-    }, 60000);
-  }, [ticker]);
-
-  const handlePredict = async () => {
-    try {
-      setPredicting(true);
-      await axios.post(`${API_URL}/load_model`, { model_name: cardModel });
-      const res = await axios.post(`${API_URL}/predict`, { model_name: cardModel, tickers: [ticker], lookback: 120, pred_len: cardPredLen });
-      const tickRes = res.data.results[ticker];
-      if (tickRes?.error) { setPredicting(false); return; }
-      const historical = tickRes.historical || [];
-      const predPoints = tickRes.prediction || [];
-      const anchor = historical.length > 0
-        ? { time: new Date(historical[historical.length - 1].timestamps).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-            fullTime: historical[historical.length - 1].timestamps, close: Number(historical[historical.length - 1].close) }
-        : null;
-      const predData = [];
-      if (anchor) predData.push({ time: anchor.time, fullTime: anchor.fullTime, close: anchor.close });
-      predPoints.forEach(p => { predData.push({ time: new Date(p.timestamps).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), fullTime: p.timestamps, close: Number(p.close) }); });
-      const newPred = {
-        id: ++predIdCounter, model: cardModel, predLen: cardPredLen,
-        color: predColors[(predIdCounter - 1) % predColors.length],
-        createdAt: new Date().toISOString(), data: predData,
-      };
-      setPredictions(prev => [...prev, newPred]);
-      if (historical.length > 0) {
-        setGtData(historical.map(h => ({ time: new Date(h.timestamps).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }), fullTime: h.timestamps, groundTruth: Number(h.close) })));
-        setLatestPrice(Number(historical[historical.length - 1].close));
-      }
-      setPredicting(false);
-    } catch (e) { console.error('Prediction failed', e); setPredicting(false); }
-  };
-
-  const handleRemovePrediction = (id) => setPredictions(prev => prev.filter(p => p.id !== id));
-  const handleClearAll = () => setPredictions([]);
-
-  const mergedData = useMemo(() => {
-    const timeMap = new Map();
-    gtData.forEach(pt => { timeMap.set(pt.time, { time: pt.time, fullTime: pt.fullTime, groundTruth: pt.groundTruth }); });
-    predictions.forEach(pred => {
-      const key = `pred_${pred.id}`;
-      pred.data.forEach(pt => {
-        if (!timeMap.has(pt.time)) timeMap.set(pt.time, { time: pt.time, fullTime: pt.fullTime, groundTruth: null });
-        timeMap.get(pt.time)[key] = pt.close;
-      });
-    });
-    const predKeys = predictions.map(p => `pred_${p.id}`);
-    const entries = Array.from(timeMap.values());
-    if (predKeys.length >= 2) {
-      entries.forEach(entry => {
-        const vals = predKeys.map(k => entry[k]).filter(v => v != null);
-        if (vals.length >= 2) entry.mean = vals.reduce((s, v) => s + v, 0) / vals.length;
-      });
-    }
-    entries.sort((a, b) => new Date(a.fullTime) - new Date(b.fullTime));
-    return entries;
-  }, [gtData, predictions]);
-
-  const renderChart = () => {
-    const commonProps = { data: mergedData, margin: { top: 5, right: 10, left: -15, bottom: 5 } };
-    const xAxis = <XAxis dataKey="time" stroke={axisColor} fontSize={11} tickMargin={8} minTickGap={25} />;
-    const yAxis = <YAxis stroke={axisColor} domain={['auto', 'auto']} fontSize={11} tickFormatter={v => { const n = Number(v); return isNaN(n) ? '' : `$${n.toFixed(0)}`; }} />;
-    const grid = <CartesianGrid strokeDasharray="3 3" stroke={gridColor} vertical={false} />;
-    const tooltip = <Tooltip content={<KronosTooltip predictions={predictions} theme={theme} />} />;
-    const legend = <Legend verticalAlign="top" height={28} wrapperStyle={{ fontSize: '0.65rem' }} />;
-
-    const lastGtIdx = mergedData.reduce((acc, d, i) => d.groundTruth != null ? i : acc, -1);
-    const dividerTime = lastGtIdx >= 0 ? mergedData[lastGtIdx].time : null;
-
-    const predLines = predictions.map(pred => (
-      <Line key={`pred_${pred.id}`} type="monotone" dataKey={`pred_${pred.id}`}
-        name={`P${pred.id} (${pred.model})`} stroke={pred.color} strokeWidth={1.5}
-        strokeDasharray="5 4" dot={false} isAnimationActive={false} connectNulls={true} />
-    ));
-    const meanLine = predictions.length >= 2 ? (
-      <Line key="mean" type="monotone" dataKey="mean" name="Mean"
-        stroke={meanColor} strokeWidth={2.5} strokeDasharray="2 3"
-        dot={false} isAnimationActive={false} connectNulls={true} />
-    ) : null;
-
-    if (chartType === 'area') {
-      return (
-        <AreaChart {...commonProps}>
-          {grid}{xAxis}{yAxis}{tooltip}{legend}
-          {dividerTime && <ReferenceLine x={dividerTime} stroke={refLineColor} strokeDasharray="4 4" />}
-          <defs>
-            <linearGradient id={`gt-grad-${ticker}`} x1="0" y1="0" x2="0" y2="1">
-              <stop offset="5%" stopColor={gtColor} stopOpacity={0.15} />
-              <stop offset="95%" stopColor={gtColor} stopOpacity={0} />
-            </linearGradient>
-          </defs>
-          <Area type="monotone" dataKey="groundTruth" name="Ground Truth" stroke={gtColor} strokeWidth={2}
-            fill={`url(#gt-grad-${ticker})`} dot={false} isAnimationActive={false} connectNulls={true} />
-          {predLines}{meanLine}
-        </AreaChart>
-      );
-    }
-
-    if (chartType === 'bar') {
-      return (
-        <BarChart {...commonProps}>
-          {grid}{xAxis}{yAxis}{tooltip}{legend}
-          {dividerTime && <ReferenceLine x={dividerTime} stroke={refLineColor} strokeDasharray="4 4" />}
-          <Bar dataKey="groundTruth" name="Ground Truth" fill={gtColor} opacity={0.7} radius={[2, 2, 0, 0]} isAnimationActive={false} />
-          {predictions.map(pred => (
-            <Bar key={`pred_${pred.id}`} dataKey={`pred_${pred.id}`} name={`P${pred.id}`}
-              fill={pred.color} opacity={0.5} radius={[2, 2, 0, 0]} isAnimationActive={false} />
-          ))}
-        </BarChart>
-      );
-    }
-
-    return (
-      <LineChart {...commonProps}>
-        {grid}{xAxis}{yAxis}{tooltip}{legend}
-        {dividerTime && <ReferenceLine x={dividerTime} stroke={refLineColor} strokeDasharray="4 4" />}
-        <Line type="monotone" dataKey="groundTruth" name="Ground Truth" stroke={gtColor} strokeWidth={2}
-          dot={false} isAnimationActive={false} connectNulls={true} />
-        {predLines}{meanLine}
-      </LineChart>
-    );
-  };
-
-  return (
-    <div className="glass-panel stock-card">
-      <div className="stock-card-header">
-        <div className="stock-card-left">
-          <span className="ticker-badge">{ticker}</span>
-          <span className={`price-display ${latestPrice ? 'price-up' : ''}`}>
-            {latestPrice && !isNaN(latestPrice) ? `$${latestPrice.toFixed(2)}` : '---'}
-          </span>
-          <div className="live-indicator"><div className="live-dot" /> Live</div>
-          {predictions.length > 0 && <span className="pred-count-badge">{predictions.length} pred{predictions.length > 1 ? 's' : ''}</span>}
-        </div>
-
-        <div className="stock-card-controls">
-          <div className="chart-type-group">
-            {['line', 'area', 'bar'].map(t => (
-              <button key={t} className={`chart-type-btn ${chartType === t ? 'active' : ''}`} onClick={() => setChartType(t)}>
-                {t.charAt(0).toUpperCase() + t.slice(1)}
-              </button>
-            ))}
-          </div>
-          <button className="chart-type-btn active" onClick={onToggleSpan}
-            title={span === 1 ? 'Expand' : 'Shrink'} style={{ borderRadius: 'var(--r-sm)', border: '1px solid var(--edge)' }}>
-            {span === 1 ? <Maximize2 size={12} /> : <Minimize2 size={12} />}
-          </button>
-          <select className="glass-input" value={cardModel} onChange={e => setCardModel(e.target.value)}>
-            {models.map(m => <option key={m} value={m}>{m}</option>)}
-          </select>
-          <select className="glass-input" value={cardPredLen} onChange={e => setCardPredLen(Number(e.target.value))}>
-            <option value={5}>5m</option><option value={10}>10m</option><option value={30}>30m</option><option value={60}>1h</option>
-          </select>
-          <button className="btn-predict" onClick={handlePredict} disabled={predicting}>
-            {predicting ? <Loader size={13} className="spin" /> : <TrendingUp size={13} />}
-            {predicting ? 'Running' : 'Predict'}
-          </button>
-          {predictions.length > 0 && <button className="btn-clear-pred" onClick={handleClearAll}><Eraser size={12} /> Clear</button>}
-          <button className="btn-icon-danger" onClick={onRemove} title="Remove"><Trash2 size={13} /></button>
-        </div>
-      </div>
-
-      <div className="chart-wrapper">
-        {loading && <div className="status-overlay"><Loader size={24} className="spin" style={{ color: 'var(--signal-live)' }} /><p>Fetching {ticker}...</p></div>}
-        {error && <div className="status-overlay"><p style={{ color: 'var(--signal-danger)' }}>Error: {error}</p></div>}
-        {predicting && !loading && <div className="predicting-badge"><Loader size={11} className="spin" /> Inference...</div>}
-        {!loading && !error && mergedData.length > 0 && (
-          <ErrorBoundary>
-            <ResponsiveContainer width="100%" height="100%">{renderChart()}</ResponsiveContainer>
-          </ErrorBoundary>
-        )}
-      </div>
-
-      {predictions.length > 0 && (
-        <div className="pred-chips-bar">
-          {predictions.map(pred => <PredictionChip key={pred.id} pred={pred} onRemove={handleRemovePrediction} />)}
-        </div>
-      )}
-    </div>
-  );
-};
+// StockCard completely moved to separate file
 
 /* ─── App Shell ───────────────────────────────────────── */
 export default function App() {
@@ -476,10 +147,42 @@ export default function App() {
   const [overIdx, setOverIdx] = useState(null);
   const [tickerData, setTickerData] = useState(null);
 
+  // Phase 4: Leaderboard & Run Drawer
+  const [showDrawer, setShowDrawer] = useState(false);
+  const [leaderboard, setLeaderboard] = useState(null);
+
   useEffect(() => {
     axios.get(`${API_URL}/models`).then(res => setModels(res.data.models)).catch(err => console.error('Failed to fetch models', err));
     axios.get(`${API_URL}/tickers`).then(res => setTickerData(res.data)).catch(err => console.error('Failed to fetch tickers', err));
   }, []);
+
+  useEffect(() => {
+    // Poll the backend to score any pending forecasts automatically as time moves forward
+    const scoreInterval = setInterval(() => {
+      axios.post(`${API_URL}/score_pending`).catch(() => {});
+    }, 60000);
+    return () => clearInterval(scoreInterval);
+  }, []);
+
+  const openDrawer = async () => {
+    setShowDrawer(true);
+    setLeaderboard(null); // Optional: clear to show loading spin if we want a fresh state
+    try {
+      // Force an immediate score before fetching the leaderboard
+      await axios.post(`${API_URL}/score_pending`);
+      const res = await axios.get(`${API_URL}/leaderboard`);
+      setLeaderboard(res.data.leaderboard);
+    } catch(e) {
+      console.error(e);
+      // Fallback in case scoring throws an internal error, try to fetch leaderboard anyway
+      try {
+        const res = await axios.get(`${API_URL}/leaderboard`);
+        setLeaderboard(res.data.leaderboard);
+      } catch(e2) {
+        setLeaderboard({});
+      }
+    }
+  };
 
   const handleAddTicker = (t) => {
     const sym = t.toUpperCase().trim();
@@ -529,6 +232,10 @@ export default function App() {
             {/* Hidden spacer — search has its own enter-to-add */}
           </button>
 
+          <button className="theme-toggle" onClick={openDrawer} title="Leaderboard & Runs">
+            <BarChart2 size={16} />
+          </button>
+          
           <button className="theme-toggle" onClick={toggleTheme} title={theme === 'light' ? 'Switch to dark mode' : 'Switch to light mode'}>
             {theme === 'light' ? <Moon size={16} /> : <Sun size={16} />}
           </button>
@@ -560,6 +267,61 @@ export default function App() {
           ))}
         </div>
       )}
+
+      {/* Leaderboard Drawer Overlay */}
+      {showDrawer && (
+        <div className="drawer-overlay" onClick={() => setShowDrawer(false)} style={{
+            position:'fixed', top:0, left:0, width:'100vw', height:'100vh', background:'rgba(0,0,0,0.55)', zIndex: 999, backdropFilter:'blur(4px)'
+        }}>
+          <div className="drawer-panel" onClick={e => e.stopPropagation()} style={{
+              position:'absolute', right:0, top:0, width:'440px', height:'100%',
+              background:'var(--surface-0)',
+              borderLeft:'1px solid var(--edge-emphasis)', boxShadow:'-10px 0 40px rgba(0,0,0,0.25)', padding:'1.5rem',
+              overflowY:'auto', display:'flex', flexDirection:'column', gap:'1rem'
+          }}>
+            <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', borderBottom:'1px solid var(--edge)', paddingBottom:'0.75rem'}}>
+              <h2 style={{margin:0, fontSize:'1.1rem', fontWeight:700, display:'flex', alignItems:'center', gap:'0.5rem', color:'var(--ink-primary)'}}>
+                <BarChart2 size={18} color="var(--signal-live)" /> Model Leaderboard
+              </h2>
+              <button onClick={() => setShowDrawer(false)} style={{background:'var(--surface-2)', border:'1px solid var(--edge)', borderRadius:'6px', width:'28px', height:'28px', display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', color:'var(--ink-secondary)'}}><X size={16}/></button>
+            </div>
+            
+            {!leaderboard ? <Activity className="spin" size={24} style={{alignSelf:'center', marginTop:'2rem', color:'var(--ink-tertiary)'}} /> : 
+             Object.keys(leaderboard).length === 0 ? (
+              <div style={{padding:'2rem 1rem', textAlign:'center'}}>
+                <p style={{color:'var(--ink-secondary)', fontSize:'0.85rem', lineHeight:'1.5'}}>No tracked forecasts scored yet.<br/>Predict, wait for the ground-truth candle, then open this drawer again.</p>
+              </div>
+             ) :
+             Object.entries(leaderboard).map(([mName, data]) => (
+                <div key={mName} style={{background:'var(--surface-1)', border:'1px solid var(--edge)', borderRadius:'10px', padding:'1rem'}}>
+                    <h3 style={{margin:'0 0 0.75rem 0', fontSize:'0.95rem', fontWeight:700, color:'var(--ink-primary)', fontFamily:"'DM Mono', monospace"}}>{mName}</h3>
+                    <div style={{display:'flex', gap:'1.25rem', fontSize:'0.82rem', color:'var(--ink-primary)'}}>
+                       <div><span style={{color:'var(--ink-secondary)', fontWeight:500}}>MAE: </span><strong>{data.overall?.mae?.toFixed(4) || '--'}</strong></div>
+                       <div><span style={{color:'var(--ink-secondary)', fontWeight:500}}>RMSE: </span><strong>{data.overall?.rmse?.toFixed(4) || '--'}</strong></div>
+                       <div><span style={{color:'var(--ink-secondary)', fontWeight:500}}>Runs: </span><strong>{data.overall?.count || 0}</strong></div>
+                    </div>
+                    {data.regimes && Object.keys(data.regimes).length > 0 && (
+                        <div style={{marginTop:'0.75rem', fontSize:'0.75rem', borderTop:'1px solid var(--edge-soft)', paddingTop:'0.5rem'}}>
+                            <div style={{color:'var(--ink-secondary)', fontWeight:600, marginBottom:'0.4rem', textTransform:'uppercase', letterSpacing:'0.05em', fontSize:'0.65rem'}}>Regime Breakdowns</div>
+                            {Object.entries(data.regimes).map(([rType, rVals]) => (
+                                <div key={rType} style={{marginTop:'0.35rem', display:'flex', flexWrap:'wrap', gap:'0.35rem', alignItems:'center'}}>
+                                    <span style={{color:'var(--ink-secondary)', textTransform:'capitalize', fontWeight:600, minWidth:'65px'}}>{rType}:</span>
+                                    {Object.entries(rVals).map(([val, vStats]) => (
+                                        <span key={val} style={{background:'var(--surface-2)', border:'1px solid var(--edge)', padding:'2px 8px', borderRadius:'4px', color:'var(--ink-primary)', fontFamily:"'DM Mono', monospace", fontSize:'0.72rem'}}>
+                                            {val} <span style={{color:'var(--ink-secondary)'}}>({vStats.mae?.toFixed(2)})</span>
+                                        </span>
+                                    ))}
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+             ))
+            }
+          </div>
+        </div>
+      )}
+
     </div>
   );
 }
